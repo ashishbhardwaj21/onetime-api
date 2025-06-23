@@ -1,0 +1,4 @@
+{
+    "appService.defaultWebAppToDeploy": "/subscriptions/c1801ce6-7fef-4dc0-aa44-bfa33a314eeb/resourceGroups/onetime-resources/providers/Microsoft.Web/sites/myapp-api-7vhw6fhdrelcs",
+    "appService.deploySubpath": "OneTime.API"
+}

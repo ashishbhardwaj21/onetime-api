@@ -1,0 +1,318 @@
+version: '3.8'
+
+services:
+  # SQL Server Database
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: onetime-sqlserver
+    environment:
+      ACCEPT_EULA: Y
+      SA_PASSWORD: OneTime123!
+      MSSQL_PID: Developer
+    ports:
+      - "1433:1433"
+    volumes:
+      - sqlserver_data:/var/opt/mssql
+    networks:
+      - onetime-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/opt/mssql-tools/bin/sqlcmd", "-S", "localhost", "-U", "sa", "-P", "OneTime123!", "-Q", "SELECT 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: onetime-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - onetime-network
+    restart: unless-stopped
+    command: redis-server --appendonly yes --requirepass OneTimeRedis123!
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "OneTimeRedis123!", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # OneTime API
+  onetime-api:
+    build:
+      context: .
+      dockerfile: OneTime.API/Dockerfile
+    container_name: onetime-api
+    ports:
+      - "5000:8080"
+      - "5001:8081"
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ASPNETCORE_URLS=http://+:8080;https://+:8081
+      - ASPNETCORE_Kestrel__Certificates__Default__Password=OneTime123!
+      - ASPNETCORE_Kestrel__Certificates__Default__Path=/https/aspnetapp.pfx
+      - ConnectionStrings__DefaultConnection=Server=sqlserver;Database=OneTimeDb;User Id=sa;Password=OneTime123!;TrustServerCertificate=true;
+      - ConnectionStrings__Redis=redis:6379,password=OneTimeRedis123!
+      - JWT__Key=ThisIsAVerySecureKeyThatIsAtLeast32CharactersLong!
+      - JWT__Issuer=OneTimeAPI
+      - JWT__Audience=OneTimeApp
+    volumes:
+      - ~/.aspnet/https:/https:ro
+      - onetime_uploads:/app/uploads
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - onetime-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # Nginx Reverse Proxy
+  nginx:
+    image: nginx:alpine
+    container_name: onetime-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - onetime_static:/var/www/static
+    depends_on:
+      - onetime-api
+    networks:
+      - onetime-network
+    restart: unless-stopped
+
+  # Elasticsearch for Logging
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    container_name: onetime-elasticsearch
+    environment:
+      - discovery.type=single-node
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+      - xpack.security.enabled=false
+      - xpack.security.enrollment.enabled=false
+    ports:
+      - "9200:9200"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    networks:
+      - onetime-network
+    restart: unless-stopped
+
+  # Kibana for Log Visualization
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.11.0
+    container_name: onetime-kibana
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    ports:
+      - "5601:5601"
+    depends_on:
+      - elasticsearch
+    networks:
+      - onetime-network
+    restart: unless-stopped
+
+  # Prometheus for Metrics
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: onetime-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    networks:
+      - onetime-network
+    restart: unless-stopped
+
+  # Grafana for Monitoring Dashboard
+  grafana:
+    image: grafana/grafana:latest
+    container_name: onetime-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=OneTimeGrafana123!
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    depends_on:
+      - prometheus
+    networks:
+      - onetime-network
+    restart: unless-stopped
+
+  # Seq for Structured Logging
+  seq:
+    image: datalust/seq:latest
+    container_name: onetime-seq
+    environment:
+      - ACCEPT_EULA=Y
+      - SEQ_FIRSTRUN_ADMINPASSWORDHASH=OneTimeSeq123!
+    ports:
+      - "5341:80"
+    volumes:
+      - seq_data:/data
+    networks:
+      - onetime-network
+    restart: unless-stopped
+
+  # Hangfire for Background Jobs
+  hangfire:
+    build:
+      context: .
+      dockerfile: OneTime.API/Dockerfile.Hangfire
+    container_name: onetime-hangfire
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ConnectionStrings__DefaultConnection=Server=sqlserver;Database=OneTimeDb;User Id=sa;Password=OneTime123!;TrustServerCertificate=true;
+      - ConnectionStrings__Redis=redis:6379,password=OneTimeRedis123!
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - onetime-network
+    restart: unless-stopped
+
+  # PgAdmin for Database Management (Alternative)
+  # Uncomment if you prefer PostgreSQL
+  # postgres:
+  #   image: postgres:15-alpine
+  #   container_name: onetime-postgres
+  #   environment:
+  #     POSTGRES_DB: oneTimeDb
+  #     POSTGRES_USER: onetime
+  #     POSTGRES_PASSWORD: OneTime123!
+  #   ports:
+  #     - "5432:5432"
+  #   volumes:
+  #     - postgres_data:/var/lib/postgresql/data
+  #   networks:
+  #     - onetime-network
+  #   restart: unless-stopped
+
+  # MinIO for S3-Compatible Storage (Alternative to Azure Blob)
+  minio:
+    image: minio/minio:latest
+    container_name: onetime-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: onetime
+      MINIO_ROOT_PASSWORD: OneTimeMinio123!
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - onetime-network
+    restart: unless-stopped
+
+  # RabbitMQ for Message Queuing (Alternative to Service Bus)
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: onetime-rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: onetime
+      RABBITMQ_DEFAULT_PASS: OneTimeRabbit123!
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - onetime-network
+    restart: unless-stopped
+
+  # Mailhog for Email Testing
+  mailhog:
+    image: mailhog/mailhog:latest
+    container_name: onetime-mailhog
+    ports:
+      - "1025:1025"
+      - "8025:8025"
+    networks:
+      - onetime-network
+    restart: unless-stopped
+
+  # Jaeger for Distributed Tracing
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: onetime-jaeger
+    ports:
+      - "16686:16686"
+      - "14268:14268"
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    networks:
+      - onetime-network
+    restart: unless-stopped
+
+  # Load Balancer (HAProxy)
+  haproxy:
+    image: haproxy:alpine
+    container_name: onetime-haproxy
+    ports:
+      - "8080:80"
+      - "8443:443"
+      - "8404:8404"  # Stats page
+    volumes:
+      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    depends_on:
+      - onetime-api
+    networks:
+      - onetime-network
+    restart: unless-stopped
+
+volumes:
+  sqlserver_data:
+    driver: local
+  redis_data:
+    driver: local
+  elasticsearch_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+  seq_data:
+    driver: local
+  minio_data:
+    driver: local
+  rabbitmq_data:
+    driver: local
+  onetime_uploads:
+    driver: local
+  onetime_static:
+    driver: local
+  # postgres_data:
+  #   driver: local
+
+networks:
+  onetime-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
